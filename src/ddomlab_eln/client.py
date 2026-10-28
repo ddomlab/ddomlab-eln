@@ -1,9 +1,11 @@
 """The connection to the DDOM Lab eLabFTW."""
 import difflib
+import hashlib
 import html
 import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import elabapi_python
 from elabapi_python.rest import ApiException
@@ -164,9 +166,7 @@ class ELN:
             _, _, headers = api.post_experiment_with_http_info(body=body)
         except ApiException as e:
             raise ELNError(f"The ELN refused to create the experiment: {_server_message(e)}") from None
-
-        # The server says where the new experiment is, e.g. .../api/v2/experiments/612
-        return int(headers["Location"].rstrip("/").split("/")[-1])
+        return _id_from_location(headers)
 
     def update_fields(self, exp_id: int, fields: dict) -> None:
         """Change the values of an existing experiment's fields.
@@ -250,6 +250,50 @@ class ELN:
         new_text = text if exp["content_type"] == MARKDOWN else _as_html(text)
         self._patch_experiment(exp_id, {"body": new_text}, "change the main text of")
 
+    def upload_file(self, exp_id: int, path: str | Path, comment: str | None = None) -> int:
+        """Attach a file to an experiment.
+
+        If the same file (same name and same contents) is already attached, nothing is
+        uploaded again and the existing upload's ID is returned. So re-running a script
+        doesn't pile up copies. A changed file with the same name is uploaded as a new file.
+
+        Args:
+            exp_id: The experiment's ID.
+            path: The file on this computer, e.g. `"C:/XRD/run43.xy"` or a `pathlib.Path`.
+            comment: A short note shown next to the file on the web page.
+
+        Returns:
+            The upload's ID.
+
+        Raises:
+            ELNError: If the file doesn't exist, there is no such experiment, you can't
+                edit it, or the file is bigger than the ELN accepts (100 MB on the lab's ELN).
+
+        Example:
+            >>> eln.upload_file(612, "C:/XRD/run43.xy", comment="raw scan")
+            11766
+        """
+        path = Path(path)
+        if not path.is_file():
+            raise ELNError(f"There is no file at {path}.")
+        with path.open("rb") as f:
+            fingerprint = hashlib.file_digest(f, "sha256").hexdigest()
+
+        for upload in self._read_experiment(exp_id)["uploads"] or []:
+            if upload["real_name"] == path.name and upload["hash"] == fingerprint:
+                return upload["id"]
+
+        extra = {"comment": comment} if comment else {}
+        api = elabapi_python.UploadsApi(self.client)
+        try:
+            _, _, headers = api.post_upload_with_http_info("experiments", exp_id, file=str(path), **extra)
+        except ApiException as e:
+            if e.status == 413:
+                size_mb = path.stat().st_size / 1024**2  # MB the way the server's "100M" limit counts
+                raise ELNError(f"{path.name} ({size_mb:.0f} MB) is bigger than the ELN accepts.") from None
+            raise ELNError(f"The ELN refused to upload {path.name} to experiment #{exp_id}: {_server_message(e)}") from None
+        return _id_from_location(headers)
+
     def _read_experiment(self, exp_id: int) -> dict:
         """The experiment exactly as the ELN sends it (raw JSON, so nothing gets lost)."""
         api = elabapi_python.ExperimentsApi(self.client)
@@ -268,6 +312,11 @@ class ELN:
             api.patch_experiment(id=exp_id, body=changes)
         except ApiException as e:
             raise ELNError(f"The ELN refused to {doing} experiment #{exp_id}: {_server_message(e)}") from None
+
+
+def _id_from_location(headers) -> int:
+    """The ID of what was just created. The server says where it is, e.g. .../experiments/612/uploads/11766."""
+    return int(headers["Location"].rstrip("/").split("/")[-1])
 
 
 def _as_html(text: str) -> str:
