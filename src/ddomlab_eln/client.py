@@ -43,6 +43,22 @@ class Template:
     fields: dict
 
 
+@dataclass
+class Resource:
+    """A resource (an entry in the Resources database: a chemical, sample, instrument…).
+
+    You get these from `ELN.find_resources`.
+
+    Attributes:
+        id: The resource's ID. Pass it to `ELN.link_resource`.
+        title: The resource's title.
+        category: Its category, e.g. "Chemical Compound" or "Instrument".
+    """
+    id: int
+    title: str
+    category: str
+
+
 class ELN:
     """A connection to the lab's eLabFTW, acting as the owner of the API key.
 
@@ -293,6 +309,109 @@ class ELN:
                 raise ELNError(f"{path.name} ({size_mb:.0f} MB) is bigger than the ELN accepts.") from None
             raise ELNError(f"The ELN refused to upload {path.name} to experiment #{exp_id}: {_server_message(e)}") from None
         return _id_from_location(headers)
+
+    def find_resources(self, text: str) -> list[Resource]:
+        """Search resources by title (and text), to find the ID to link.
+
+        Returns every match; it never picks one for you. The lab has several resources
+        called "acetone", so check the title and category and use the right ID.
+
+        Args:
+            text: What to search for. Upper or lower case doesn't matter.
+
+        Returns:
+            Matching resources, those whose title matches best first. Empty if none match.
+
+        Example:
+            >>> for r in eln.find_resources("acetone"):
+            ...     print(r.id, r.title, r.category)
+            562 acetone Chemical Compound
+            279 Acetone Chemical Compound
+            577 Acetone (spectrophotometric grade) Chemical Compound
+        """
+        api = elabapi_python.ItemsApi(self.client)
+        try:
+            # scope=3: everything you're allowed to see, whatever your web-page settings say
+            response = api.read_items(q=text, limit=100, scope=3, _preload_content=False)
+        except ApiException as e:
+            raise ELNError(f"Couldn't search resources: {_server_message(e)}") from None
+        found = [Resource(id=r["id"], title=r["title"], category=r["category_title"] or "")
+                 for r in json.loads(response.data)]
+
+        # exact title first, then titles that contain the text, then matches only in the main text
+        wanted = text.casefold()
+        return sorted(found, key=lambda r: (r.title.casefold() != wanted, wanted not in r.title.casefold()))
+
+    def link_resource(self, exp_id: int, resource_id: int) -> str:
+        """Link a resource to an experiment (it shows under "Linked resources").
+
+        Linking the same resource twice is harmless: there is still one link.
+
+        Args:
+            exp_id: The experiment's ID.
+            resource_id: The resource's ID, e.g. from `ELN.find_resources`.
+
+        Returns:
+            The resource's title, so your script can log what it linked.
+
+        Raises:
+            ELNError: If the experiment or the resource doesn't exist or you can't see it,
+                or you can't edit the experiment.
+
+        Example:
+            >>> eln.link_resource(612, 562)
+            'acetone'
+        """
+        self._read_experiment(exp_id)
+        resource = self._read_item(resource_id)
+        api = elabapi_python.LinksToItemsApi(self.client)
+        try:
+            api.post_entity_items_links("experiments", exp_id, resource_id)
+        except ApiException as e:
+            raise ELNError(f"The ELN refused to link resource #{resource_id} to experiment #{exp_id}: {_server_message(e)}") from None
+        return resource["title"]
+
+    def link_experiment(self, exp_id: int, other_id: int) -> str:
+        """Link another experiment to this one (it shows under "Linked experiments").
+
+        The other experiment then lists this one as related. Linking twice is harmless.
+
+        Args:
+            exp_id: The experiment to add the link to.
+            other_id: The experiment to link to. Must be a different experiment.
+
+        Returns:
+            The other experiment's title, so your script can log what it linked.
+
+        Raises:
+            ELNError: If the two IDs are the same, either experiment doesn't exist or you
+                can't see it, or you can't edit the first one.
+
+        Example:
+            >>> eln.link_experiment(612, 598)
+            'XRD scan S-11'
+        """
+        if exp_id == other_id:
+            raise ELNError(f"Can't link experiment #{exp_id} to itself.")
+        self._read_experiment(exp_id)
+        other = self._read_experiment(other_id)
+        api = elabapi_python.LinksToExperimentsApi(self.client)
+        try:
+            api.post_entity_experiments_links("experiments", exp_id, other_id)
+        except ApiException as e:
+            raise ELNError(f"The ELN refused to link experiment #{other_id} to experiment #{exp_id}: {_server_message(e)}") from None
+        return other["title"]
+
+    def _read_item(self, item_id: int) -> dict:
+        """A resource exactly as the ELN sends it (raw JSON)."""
+        api = elabapi_python.ItemsApi(self.client)
+        try:
+            response = api.get_item(item_id, _preload_content=False)
+        except ApiException as e:
+            if e.status in (403, 404):
+                raise ELNError(f"There is no resource #{item_id} that you can see.") from None
+            raise ELNError(f"Couldn't read resource #{item_id}: {_server_message(e)}") from None
+        return json.loads(response.data)
 
     def _read_experiment(self, exp_id: int) -> dict:
         """The experiment exactly as the ELN sends it (raw JSON, so nothing gets lost)."""
