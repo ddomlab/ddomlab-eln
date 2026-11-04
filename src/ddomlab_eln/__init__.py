@@ -10,6 +10,28 @@ t = eln.get_template(18)
 print(list(t.fields))
 ```
 """
-from .client import ELN, ELNError, ExperimentSummary, Resource, Template, show_experiments
+from .client import (
+    ELN,
+    Attachment,
+    ELNError,
+    Experiment,
+    ExperimentSummary,
+    LinkedExperiment,
+    Links,
+    Resource,
+    Template,
+    show_experiments,
+)
 
-__all__ = ["ELN", "ELNError", "ExperimentSummary", "Resource", "Template", "show_experiments"]
+__all__ = [
+    "ELN",
+    "ELNError",
+    "Attachment",
+    "Experiment",
+    "ExperimentSummary",
+    "LinkedExperiment",
+    "Links",
+    "Resource",
+    "Template",
+    "show_experiments",
+]

@@ -15,6 +15,8 @@ from elabapi_python.rest import ApiException
 DEFAULT_URL = "https://eln.ddomlab.org"
 MARKDOWN = 2  # an experiment's content_type: 1 = rich-text editor (HTML), 2 = Markdown
 FROM_TEMPLATE = 3  # an experiment's created_from_type: 3 = an experiment template, 1 = another experiment
+DELETED = 3  # an entry's state: 1 = normal, 2 = archived, 3 = deleted (in the ELN's trash)
+FIELD_TYPES = ("text", "number", "select", "date", "checkbox")  # the ones add_field can check
 
 
 class ELNError(Exception):
@@ -89,6 +91,62 @@ class ExperimentSummary:
     tags: list[str]
     fields: dict
     first_line: str
+
+
+@dataclass
+class Attachment:
+    """A file attached to an experiment.
+
+    Attributes:
+        id: The upload's ID.
+        name: The file's name.
+        comment: The note shown next to the file. Empty if it has none.
+        size: The file's size in bytes.
+    """
+    id: int
+    name: str
+    comment: str
+    size: int
+
+
+@dataclass
+class Experiment(ExperimentSummary):
+    """One whole experiment: everything in `ExperimentSummary`, plus its text and files.
+
+    You get one from `ELN.get_experiment`.
+
+    Attributes:
+        main_text: The main text as stored: HTML, or Markdown if the experiment uses Markdown.
+        files: The files attached to it.
+    """
+    main_text: str
+    files: list[Attachment]
+
+
+@dataclass
+class LinkedExperiment:
+    """An experiment at the other end of a link.
+
+    Attributes:
+        id: The experiment's ID.
+        title: The experiment's title.
+    """
+    id: int
+    title: str
+
+
+@dataclass
+class Links:
+    """What an experiment is linked to. You get this from `ELN.get_links`.
+
+    Attributes:
+        resources: The resources this experiment links to.
+        experiments: The experiments this experiment links to.
+        linked_from: Other experiments that link to this one.
+    """
+    resources: list[Resource]
+    experiments: list[LinkedExperiment]
+    linked_from: list[LinkedExperiment]
 
 
 class ELN:
@@ -170,6 +228,29 @@ class ELN:
         data = json.loads(response.data)
         return Template(id=data["id"], title=data["title"], fields=_fields_in_order(data["metadata"]))
 
+    def list_templates(self) -> list[Template]:
+        """List the experiment templates you can use, with their fields.
+
+        Returns:
+            Every experiment template you're allowed to see.
+
+        Raises:
+            ELNError: If the ELN refuses the request.
+
+        Example:
+            >>> for t in eln.list_templates():
+            ...     print(t.id, t.title, list(t.fields))
+            18 TEST XRD run ['Sample ID', 'Scan Rate', 'Mode']
+            7 Electrochemistry []
+        """
+        api = elabapi_python.ExperimentsTemplatesApi(self.client)
+        try:
+            response = api.read_experiments_templates(full=1, _preload_content=False)
+        except ApiException as e:
+            raise ELNError(f"Couldn't list the templates: {_server_message(e)}") from None
+        return [Template(id=t["id"], title=t["title"], fields=_fields_in_order(t["metadata"]))
+                for t in json.loads(response.data)]
+
     def create_experiment(self, template_id: int, title: str, fields: dict | None = None) -> int:
         """Create a new experiment from a template.
 
@@ -242,6 +323,104 @@ class ELN:
         # value can't leave the others half-saved (updatemetadatafield saves one at a time)
         values = {name: {"value": value} for name, value in fields.items()}
         self._patch_experiment(exp_id, {"metadatamerge": json.dumps({"extra_fields": values})}, "update the fields of")
+
+    def add_field(
+        self,
+        exp_id: int,
+        name: str,
+        value="",
+        *,
+        field_type: str = "text",
+        unit: str | None = None,
+        options: list[str] | None = None,
+    ) -> None:
+        """Add a new field to one experiment. Its template isn't changed.
+
+        Use this for a value only some runs have. If every run needs the field, add it
+        to the template instead. To change a field that already exists, use `ELN.update_fields`.
+
+        Args:
+            exp_id: The experiment's ID.
+            name: The new field's name.
+            value: Its value. Leave out to add it empty. For a `"date"` field, a date like
+                `"2026-11-04"`. For a `"checkbox"` field, True or False.
+            field_type: One of `"text"`, `"number"`, `"select"` (a dropdown), `"date"` or `"checkbox"`.
+            unit: The unit, for a `"number"` field.
+            options: The choices, for a `"select"` field.
+
+        Raises:
+            ELNError: If the experiment already has a field with this name, there is no such
+                experiment, or the type, unit, options or value aren't valid. Nothing is
+                changed in any of these cases.
+
+        Example:
+            >>> eln.add_field(612, "Room temperature", 21.5, field_type="number", unit="C")
+            >>> eln.add_field(612, "Detector", "fast", field_type="select", options=["fast", "slow"])
+        """
+        name = name.strip()
+        if not name:
+            raise ELNError("A field needs a name.")
+        if field_type not in FIELD_TYPES:
+            raise ELNError(f"field_type must be one of {', '.join(FIELD_TYPES)}, not {field_type!r}.")
+        if unit and field_type != "number":
+            raise ELNError(f'Only a "number" field can have a unit, not a "{field_type}" field.')
+        if field_type == "select" and not options:
+            raise ELNError('A "select" field needs options.')
+        if options and field_type != "select":
+            raise ELNError(f'Only a "select" field can have options, not a "{field_type}" field.')
+
+        if field_type == "date" and value:
+            value = _day(value, f'The value of "{name}"')
+        if field_type == "checkbox":
+            if value != "" and not isinstance(value, bool):
+                raise ELNError(f'The value of checkbox "{name}" must be True or False, not {value!r}.')
+            value = "on" if value is True else ""
+
+        exp = self._read_experiment(exp_id)
+        known = _fields_in_order(exp["metadata"])
+        same_name = [existing for existing in known if existing.casefold() == name.casefold()]
+        if same_name:
+            raise ELNError(f'Experiment #{exp_id} already has a field "{same_name[0]}". To change its value, use update_fields.')
+
+        field = {"type": field_type, "value": value}
+        if unit:
+            field |= {"unit": unit, "units": [unit]}
+        if options:
+            field["options"] = _as_list(options)
+        positions = [int(settings["position"]) for settings in known.values() if "position" in settings]
+        if positions:
+            # The web page can't order a mix of fields with and without a position
+            field["position"] = max(positions) + 1
+        # metadatamerge checks numbers and options, and leaves the other fields alone
+        self._patch_experiment(exp_id, {"metadatamerge": json.dumps({"extra_fields": {name: field}})}, "add a field to")
+
+    def add_tags(self, exp_id: int, tags: str | list[str]) -> None:
+        """Add one or more tags to an experiment.
+
+        A tag it already has is harmless. If the lab already has the tag in different
+        upper or lower case, the existing spelling is used (`p3ht` becomes `P3HT`).
+
+        Args:
+            exp_id: The experiment's ID.
+            tags: A tag, or a list of tags.
+
+        Raises:
+            ELNError: If a tag is empty, there is no such experiment, or the ELN refuses a
+                tag. Tags added before a refused one stay added.
+
+        Example:
+            >>> eln.add_tags(612, ["XRD", "P3HT"])
+        """
+        tags = _as_list(tags)
+        if not all(str(tag).strip() for tag in tags):
+            raise ELNError("A tag can't be empty.")
+        self._read_experiment(exp_id)
+        api = elabapi_python.TagsApi(self.client)
+        for tag in tags:
+            try:
+                api.post_tag("experiments", exp_id, body={"tag": str(tag)})
+            except ApiException as e:
+                raise ELNError(f'The ELN refused to add the tag "{tag}" to experiment #{exp_id}: {_server_message(e)}') from None
 
     def add_note(self, exp_id: int, text: str) -> None:
         """Add text to the end of an experiment's main text.
@@ -432,6 +611,61 @@ class ELN:
             raise ELNError(f"The ELN refused to link experiment #{other_id} to experiment #{exp_id}: {_server_message(e)}") from None
         return other["title"]
 
+    def get_links(self, exp_id: int) -> Links:
+        """See what an experiment is linked to, and what links to it.
+
+        Links to anything in the ELN's trash are left out.
+
+        Args:
+            exp_id: The experiment's ID.
+
+        Returns:
+            Its linked resources and experiments, and the experiments linking to it.
+
+        Raises:
+            ELNError: If there is no such experiment, or you can't see it.
+
+        Example:
+            >>> links = eln.get_links(612)
+            >>> [r.title for r in links.resources]
+            ['acetone']
+        """
+        exp = self._read_experiment(exp_id)
+
+        def linked(key: str) -> list[dict]:
+            return [link for link in exp[key] or [] if link["link_state"] != DELETED]
+
+        return Links(
+            resources=[Resource(id=link["entityid"], title=link["title"], category=link["category_title"] or "")
+                       for link in linked("items_links")],
+            experiments=[LinkedExperiment(id=link["entityid"], title=link["title"]) for link in linked("experiments_links")],
+            linked_from=[LinkedExperiment(id=link["entityid"], title=link["title"]) for link in linked("related_experiments_links")],
+        )
+
+    def get_experiment(self, exp_id: int) -> Experiment:
+        """Read one experiment: its fields, tags, main text and files.
+
+        Args:
+            exp_id: The experiment's ID.
+
+        Returns:
+            The experiment. Number fields come back as real numbers.
+
+        Raises:
+            ELNError: If there is no such experiment, or you can't see it.
+
+        Example:
+            >>> exp = eln.get_experiment(612)
+            >>> exp.fields["Scan Rate"]
+            2
+            >>> [f.name for f in exp.files]
+            ['run43.xy']
+        """
+        row = self._read_experiment(exp_id)
+        files = [Attachment(id=u["id"], name=u["real_name"], comment=u["comment"] or "", size=u["filesize"])
+                 for u in row["uploads"] or []]
+        return Experiment(**vars(_summary(row)), main_text=row["body"] or "", files=files)
+
     def find_experiments(
         self,
         text: str | None = None,
@@ -440,7 +674,7 @@ class ELN:
         since: str | date | None = None,
         until: str | date | None = None,
         template_id: int | None = None,
-        tags: list[str] | None = None,
+        tags: str | list[str] | None = None,
         status: str | None = None,
         owner: int | str | None = None,
         limit: int = 20,
@@ -458,7 +692,7 @@ class ELN:
             until: Only experiments dated on or before this day.
             template_id: Only experiments created from this template. Most experiments made
                 before this package don't record a template, so they won't be found this way.
-            tags: Only experiments that have all of these tags.
+            tags: Only experiments that have this tag, or all of these tags.
             status: Only experiments with exactly this status, e.g. `"Success"`.
             owner: Whose experiments: leave out for your own, give a user ID for a colleague's,
                 or `"all"` for everyone's you're allowed to see.
@@ -489,7 +723,7 @@ class ELN:
             # Quoted, because the ELN reads this as search syntax: a:b would match everything
             search["q"] = " ".join(_quoted(word) for word in text.split())
         if tags:
-            search["tags"] = list(tags)
+            search["tags"] = _as_list(tags)
 
         fields = fields or {}
         extended = [f"extrafield:{_quoted(name)}:{_quoted(value)}" for name, value in fields.items()]
@@ -636,6 +870,11 @@ def _same_value(stored, wanted) -> bool:
         return False
     pattern = ".*".join(re.escape(part) for part in str(wanted).split("%"))
     return re.fullmatch(pattern, str(stored), re.IGNORECASE | re.DOTALL) is not None
+
+
+def _as_list(value) -> list:
+    """One value or several, as a list. A lone string stays whole: list("P3HT") would split its letters."""
+    return [value] if isinstance(value, str) else list(value)
 
 
 def _quoted(value) -> str:
