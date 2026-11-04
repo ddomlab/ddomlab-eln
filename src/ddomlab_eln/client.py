@@ -4,7 +4,9 @@ import hashlib
 import html
 import json
 import os
+import re
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import elabapi_python
@@ -12,6 +14,7 @@ from elabapi_python.rest import ApiException
 
 DEFAULT_URL = "https://eln.ddomlab.org"
 MARKDOWN = 2  # an experiment's content_type: 1 = rich-text editor (HTML), 2 = Markdown
+FROM_TEMPLATE = 3  # an experiment's created_from_type: 3 = an experiment template, 1 = another experiment
 
 
 class ELNError(Exception):
@@ -57,6 +60,35 @@ class Resource:
     id: int
     title: str
     category: str
+
+
+@dataclass
+class ExperimentSummary:
+    """One experiment in a search result: enough to tell whether it's the one you want.
+
+    You get these from `ELN.find_experiments`.
+
+    Attributes:
+        id: The experiment's ID. Pass it to `ELN.link_experiment`, `ELN.add_note` and so on.
+        title: The experiment's title.
+        date: The experiment's date, e.g. `"2026-10-28"`.
+        owner: The full name of the person who owns it.
+        status: Its status, e.g. `"Success"`. Empty if it has none.
+        template_id: The template it was created from. None if it wasn't created from one,
+            which is the case for most experiments made before this package.
+        tags: Its tags.
+        fields: Field name → value, in the order shown on the web page.
+        first_line: The first line of the main text, up to 100 characters.
+    """
+    id: int
+    title: str
+    date: str
+    owner: str
+    status: str
+    template_id: int | None
+    tags: list[str]
+    fields: dict
+    first_line: str
 
 
 class ELN:
@@ -136,9 +168,7 @@ class ELN:
             raise ELNError(f"Couldn't read template #{template_id}: {e.status} {e.reason}") from None
 
         data = json.loads(response.data)
-        extra_fields = json.loads(data["metadata"] or "{}").get("extra_fields", {})
-        in_order = dict(sorted(extra_fields.items(), key=lambda item: item[1].get("position", 999)))
-        return Template(id=data["id"], title=data["title"], fields=in_order)
+        return Template(id=data["id"], title=data["title"], fields=_fields_in_order(data["metadata"]))
 
     def create_experiment(self, template_id: int, title: str, fields: dict | None = None) -> int:
         """Create a new experiment from a template.
@@ -402,6 +432,103 @@ class ELN:
             raise ELNError(f"The ELN refused to link experiment #{other_id} to experiment #{exp_id}: {_server_message(e)}") from None
         return other["title"]
 
+    def find_experiments(
+        self,
+        text: str | None = None,
+        *,
+        fields: dict | None = None,
+        since: str | date | None = None,
+        until: str | date | None = None,
+        template_id: int | None = None,
+        tags: list[str] | None = None,
+        status: str | None = None,
+        owner: int | str | None = None,
+        limit: int = 20,
+    ) -> list[ExperimentSummary]:
+        """Search experiments, newest first. With no options: your 20 newest.
+
+        Options can be combined, and an experiment must match all of them. To print the
+        results as a table, pass them to `show_experiments`.
+
+        Args:
+            text: Words to find in the title or main text. Every word must be there, in any order.
+            fields: Field name → exact value, e.g. `{"Sample ID": "S-12"}` (upper or lower case
+                doesn't matter). Use `%` for "anything": `"S-%"` finds S-1 and S-12.
+            since: Only experiments dated on or after this day, e.g. `"2026-10-01"`.
+            until: Only experiments dated on or before this day.
+            template_id: Only experiments created from this template. Most experiments made
+                before this package don't record a template, so they won't be found this way.
+            tags: Only experiments that have all of these tags.
+            status: Only experiments with exactly this status, e.g. `"Success"`.
+            owner: Whose experiments: leave out for your own, give a user ID for a colleague's,
+                or `"all"` for everyone's you're allowed to see.
+            limit: The most results to return.
+
+        Returns:
+            The matching experiments, newest first. Empty if none match.
+
+        Raises:
+            ELNError: If `since`, `until`, `owner` or `limit` isn't valid, or the search fails.
+
+        Example:
+            >>> runs = eln.find_experiments("P3HT", since="2026-10-01")
+            >>> show_experiments(runs)
+            >>> eln.link_experiment(new_id, runs[0].id)
+        """
+        if limit < 1:
+            raise ELNError("limit must be 1 or more.")
+        if owner is not None and owner != "all" and not isinstance(owner, int):
+            raise ELNError(f'owner must be a user ID or "all", not {owner!r}.')
+
+        # scope=3 so your web-page settings don't change the results. "Only mine" has to be
+        # owner=<id>: the ELN ignores scope=1 as soon as there's an extended search.
+        search = {"scope": 3, "full": 1, "order": "id", "sort": "desc"}
+        if owner != "all":
+            search["owner"] = str(self.user.userid if owner is None else owner)
+        if text and text.split():
+            # Quoted, because the ELN reads this as search syntax: a:b would match everything
+            search["q"] = " ".join(_quoted(word) for word in text.split())
+        if tags:
+            search["tags"] = list(tags)
+
+        fields = fields or {}
+        extended = [f"extrafield:{_quoted(name)}:{_quoted(value)}" for name, value in fields.items()]
+        if since:
+            extended.append(f"date:>={_day(since, 'since')}")
+        if until:
+            extended.append(f"date:<={_day(until, 'until')}")
+        if status:
+            extended.append(f"status:{_quoted(status)}")
+        if extended:
+            search["extended"] = " AND ".join(extended)
+
+        def wanted(exp: ExperimentSummary) -> bool:
+            # The ELN only offers partial matches for fields and status ("S-1" also finds S-12)
+            return (
+                all(_same_value(exp.fields.get(name), value) for name, value in fields.items())
+                and (not status or exp.status.casefold() == status.casefold())
+                and (template_id is None or exp.template_id == template_id)
+            )
+
+        # When we filter here too, a page can come back with few or no keepers, so keep reading
+        page_size = 100 if fields or status or template_id is not None else min(limit, 100)
+        api = elabapi_python.ExperimentsApi(self.client)
+        found = []
+        offset = 0
+        while len(found) < limit:
+            try:
+                response = api.read_experiments(limit=page_size, offset=offset, _preload_content=False, **search)
+            except ApiException as e:
+                raise ELNError(f"Couldn't search experiments: {_server_message(e)}") from None
+            rows = json.loads(response.data)
+            found += [exp for exp in map(_summary, rows) if wanted(exp)]
+            if len(rows) < page_size:
+                break
+            offset += page_size
+
+        # The ELN lists pinned experiments first whatever the sort order
+        return sorted(found, key=lambda exp: exp.id, reverse=True)[:limit]
+
     def _read_item(self, item_id: int) -> dict:
         """A resource exactly as the ELN sends it (raw JSON)."""
         api = elabapi_python.ItemsApi(self.client)
@@ -431,6 +558,97 @@ class ELN:
             api.patch_experiment(id=exp_id, body=changes)
         except ApiException as e:
             raise ELNError(f"The ELN refused to {doing} experiment #{exp_id}: {_server_message(e)}") from None
+
+
+def show_experiments(experiments: list[ExperimentSummary]) -> None:
+    """Print search results as a table, for choosing one by eye.
+
+    Args:
+        experiments: The results of `ELN.find_experiments`.
+
+    Example:
+        >>> show_experiments(eln.find_experiments("XRD"))
+        ID   Date        Owner      Status   Title          Fields
+        613  2026-10-28  Ada Byron  Success  XRD scan S-12  Sample ID=S-12, Scan Rate=2
+    """
+    if not experiments:
+        print("No experiments found.")
+        return
+
+    def short(text: str, length: int) -> str:
+        return text if len(text) <= length else text[:length - 1] + "…"
+
+    rows = [("ID", "Date", "Owner", "Status", "Title", "Fields")]
+    for exp in experiments:
+        first_fields = ", ".join(f"{name}={value}" for name, value in list(exp.fields.items())[:2])
+        rows.append((str(exp.id), exp.date, short(exp.owner, 20), exp.status, short(exp.title, 40), short(first_fields, 40)))
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    for row in rows:
+        print("  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip())
+
+
+def _fields_in_order(metadata: str | None) -> dict:
+    """A template's or experiment's fields from its raw metadata, in the order the web page shows."""
+    extra_fields = json.loads(metadata or "{}").get("extra_fields", {})
+    return dict(sorted(extra_fields.items(), key=lambda item: item[1].get("position", 999)))
+
+
+def _summary(row: dict) -> ExperimentSummary:
+    """One experiment from a search (raw JSON, requested with full=1) as an ExperimentSummary."""
+    return ExperimentSummary(
+        id=row["id"],
+        title=row["title"],
+        date=row["date"] or "",
+        owner=row["fullname"],
+        status=row["status_title"] or "",
+        template_id=row["created_from_id"] if row["created_from_type"] == FROM_TEMPLATE else None,
+        tags=[tag["tag"] for tag in row["tags_decoded"] or []],
+        fields={name: _field_value(settings) for name, settings in _fields_in_order(row["metadata"]).items()},
+        first_line=_first_line(row["body"]),
+    )
+
+
+def _field_value(settings: dict):
+    """A field's value, with number fields as real numbers (values sent at creation are stored as text)."""
+    value = settings.get("value")
+    if settings.get("type") == "number" and isinstance(value, str):
+        try:
+            number = float(value)
+        except ValueError:
+            return value
+        return int(number) if number.is_integer() else number
+    return value
+
+
+def _first_line(body: str | None) -> str:
+    """The first line of an experiment's main text, without HTML, up to 100 characters."""
+    text = re.sub(r"</(p|div|li|tr|h[1-6])>|<br\s*/?>", "\n", body or "", flags=re.IGNORECASE)
+    text = html.unescape(re.sub(r"<[^>]+>", "", text))
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[0][:100] if lines else ""
+
+
+def _same_value(stored, wanted) -> bool:
+    """Whether a field's value is `wanted`: whole value, any case, with % meaning "anything"."""
+    if isinstance(stored, list):
+        return any(_same_value(item, wanted) for item in stored)
+    if stored is None:
+        return False
+    pattern = ".*".join(re.escape(part) for part in str(wanted).split("%"))
+    return re.fullmatch(pattern, str(stored), re.IGNORECASE | re.DOTALL) is not None
+
+
+def _quoted(value) -> str:
+    """A value as a quoted term for the ELN's search syntax."""
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _day(value: str | date, option: str) -> str:
+    """A date option as YYYY-MM-DD, or a clear error if it isn't one."""
+    try:
+        return date.fromisoformat(str(value)[:10]).isoformat()
+    except ValueError:
+        raise ELNError(f'{option} must be a date like "2026-10-01", not {value!r}.') from None
 
 
 def _id_from_location(headers) -> int:
