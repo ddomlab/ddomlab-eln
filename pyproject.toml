@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.11"
 dependencies = [
     "elabapi-python>=6.0.1,<6.1",
+    "urllib3>=1.26",
 ]
 
 [build-system]
@@ -18,4 +19,8 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "pdoc>=16.0.0",
+    "pytest>=9.2.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

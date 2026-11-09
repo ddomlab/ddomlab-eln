@@ -10,17 +10,45 @@ from datetime import date
 from pathlib import Path
 
 import elabapi_python
+import urllib3
 from elabapi_python.rest import ApiException
 
 DEFAULT_URL = "https://eln.ddomlab.org"
+TIMEOUT = (10, 120)  # seconds: to connect, then to wait for each answer
 MARKDOWN = 2  # an experiment's content_type: 1 = rich-text editor (HTML), 2 = Markdown
 FROM_TEMPLATE = 3  # an experiment's created_from_type: 3 = an experiment template, 1 = another experiment
-DELETED = 3  # an entry's state: 1 = normal, 2 = archived, 3 = deleted (in the ELN's trash)
 FIELD_TYPES = ("text", "number", "select", "date", "checkbox")  # the ones add_field can check
 
 
 class ELNError(Exception):
     """Raised when the ELN refuses something or a check in this package fails."""
+
+
+def _guard_connection(rest_client, url: str) -> None:
+    """Give every request a timeout, and turn network failures into one clear ELNError.
+
+    Done here, on the official package's single sending function, so that every call is
+    covered, including ones made directly through `eln.client`.
+    """
+    # No automatic retries: they'd re-wait for a dead server and print warnings on the user's screen
+    rest_client.pool_manager.connection_pool_kw["retries"] = urllib3.Retry(total=None, connect=0, read=0, redirect=3, other=0)
+    unreachable = f"Couldn't reach the ELN at {url}. Check the address and your network connection."
+    send = rest_client.request
+
+    def request(*args, **kwargs):
+        kwargs["_request_timeout"] = kwargs.get("_request_timeout") or TIMEOUT
+        try:
+            return send(*args, **kwargs)
+        except urllib3.exceptions.HTTPError as e:
+            if isinstance(getattr(e, "reason", e), urllib3.exceptions.ReadTimeoutError):
+                raise ELNError(f"The ELN at {url} didn't answer in time.") from None
+            raise ELNError(unreachable) from None
+        except ApiException as e:
+            if e.status == 0:  # how the official package reports a failed secure connection
+                raise ELNError(unreachable) from None
+            raise
+
+    rest_client.request = request
 
 
 def _server_message(e: ApiException) -> str:
@@ -155,6 +183,8 @@ class ELN:
     Make one at the start of your script and use it for everything else.
     It checks the key right away, so a wrong key fails here, not halfway through a run.
 
+    Every function here raises `ELNError` if the ELN can't be reached or stops answering.
+
     Args:
         url: Address of the ELN. If not given: the `ELN_URL` environment
             variable, else https://eln.ddomlab.org.
@@ -162,7 +192,7 @@ class ELN:
             environment variable. Never write the key into a script.
 
     Raises:
-        ELNError: If no key is found, or the ELN doesn't accept it.
+        ELNError: If no key is found, the ELN doesn't accept it, or the ELN can't be reached.
 
     Example:
         >>> from ddomlab_eln import ELN
@@ -186,6 +216,7 @@ class ELN:
         config.host = self.url + "/api/v2"
         self.client = elabapi_python.ApiClient(config)
         self.client.set_default_header(header_name="Authorization", header_value=api_key)
+        _guard_connection(self.client.rest_client, self.url)
 
         # 3. Check the connection now, so a bad key fails here with a clear message
         try:
@@ -631,15 +662,11 @@ class ELN:
             ['acetone']
         """
         exp = self._read_experiment(exp_id)
-
-        def linked(key: str) -> list[dict]:
-            return [link for link in exp[key] or [] if link["link_state"] != DELETED]
-
         return Links(
             resources=[Resource(id=link["entityid"], title=link["title"], category=link["category_title"] or "")
-                       for link in linked("items_links")],
-            experiments=[LinkedExperiment(id=link["entityid"], title=link["title"]) for link in linked("experiments_links")],
-            linked_from=[LinkedExperiment(id=link["entityid"], title=link["title"]) for link in linked("related_experiments_links")],
+                       for link in exp["items_links"] or []],
+            experiments=[LinkedExperiment(id=link["entityid"], title=link["title"]) for link in exp["experiments_links"] or []],
+            linked_from=[LinkedExperiment(id=link["entityid"], title=link["title"]) for link in exp["related_experiments_links"] or []],
         )
 
     def get_experiment(self, exp_id: int) -> Experiment:
