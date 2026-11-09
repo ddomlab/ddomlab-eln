@@ -20,6 +20,9 @@ FROM_TEMPLATE = 3  # an experiment's created_from_type: 3 = an experiment templa
 FIELD_TYPES = ("text", "number", "select", "date", "checkbox")  # the ones add_field can check
 
 
+CONNECT_ATTEMPTS = 3  # the live server drops some new connections; each try waits up to TIMEOUT[0]
+
+
 class ELNError(Exception):
     """Raised when the ELN refuses something or a check in this package fails."""
 
@@ -30,23 +33,27 @@ def _guard_connection(rest_client, url: str) -> None:
     Done here, on the official package's single sending function, so that every call is
     covered, including ones made directly through `eln.client`.
     """
-    # No automatic retries: they'd re-wait for a dead server and print warnings on the user's screen
+    # urllib3's own retries are off because they print warnings on the user's screen; see the loop below
     rest_client.pool_manager.connection_pool_kw["retries"] = urllib3.Retry(total=None, connect=0, read=0, redirect=3, other=0)
     unreachable = f"Couldn't reach the ELN at {url}. Check the address and your network connection."
     send = rest_client.request
 
     def request(*args, **kwargs):
         kwargs["_request_timeout"] = kwargs.get("_request_timeout") or TIMEOUT
-        try:
-            return send(*args, **kwargs)
-        except urllib3.exceptions.HTTPError as e:
-            if isinstance(getattr(e, "reason", e), urllib3.exceptions.ReadTimeoutError):
-                raise ELNError(f"The ELN at {url} didn't answer in time.") from None
-            raise ELNError(unreachable) from None
-        except ApiException as e:
-            if e.status == 0:  # how the official package reports a failed secure connection
+        for attempt in range(1, CONNECT_ATTEMPTS + 1):
+            try:
+                return send(*args, **kwargs)
+            except urllib3.exceptions.HTTPError as e:
+                reason = getattr(e, "reason", e)
+                if isinstance(reason, urllib3.exceptions.ConnectTimeoutError) and attempt < CONNECT_ATTEMPTS:
+                    continue  # the connection never opened, so the request wasn't sent and can't be duplicated
+                if isinstance(reason, urllib3.exceptions.ReadTimeoutError):
+                    raise ELNError(f"The ELN at {url} didn't answer in time.") from None
                 raise ELNError(unreachable) from None
-            raise
+            except ApiException as e:
+                if e.status == 0:  # how the official package reports a failed secure connection
+                    raise ELNError(unreachable) from None
+                raise
 
     rest_client.request = request
 
@@ -345,7 +352,7 @@ class ELN:
             >>> eln.update_fields(612, {"Scan Rate": 3, "Mode": "fast"})
         """
         exp = self._read_experiment(exp_id)
-        known = json.loads(exp["metadata"] or "{}").get("extra_fields", {})
+        known = _fields_in_order(exp["metadata"])
         problems = _field_problems(known, fields, f"experiment #{exp_id}", every_required=False)
         if problems:
             raise ELNError(f"Didn't update experiment #{exp_id}:\n  - " + "\n  - ".join(problems))
@@ -850,7 +857,7 @@ def show_experiments(experiments: list[ExperimentSummary]) -> None:
 
 def _fields_in_order(metadata: str | None) -> dict:
     """A template's or experiment's fields from its raw metadata, in the order the web page shows."""
-    extra_fields = json.loads(metadata or "{}").get("extra_fields", {})
+    extra_fields = json.loads(metadata or "{}").get("extra_fields") or {}  # the ELN can send [] for "none"
     return dict(sorted(extra_fields.items(), key=lambda item: item[1].get("position", 999)))
 
 

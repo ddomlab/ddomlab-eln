@@ -5,6 +5,7 @@ import socket
 import threading
 
 import pytest
+import urllib3
 
 import ddomlab_eln.client as client
 from ddomlab_eln import ELN, ELNError, ExperimentSummary, show_experiments
@@ -39,6 +40,53 @@ def test_silent_server_times_out(monkeypatch):
         silent.listen(4)
         with pytest.raises(ELNError, match="didn't answer in time"):
             ELN(url=f"http://127.0.0.1:{silent.getsockname()[1]}", api_key="x")
+
+
+def _guarded_sender(failures):
+    """A guarded sending function whose first attempts raise the given errors, then succeed."""
+    import elabapi_python
+
+    rest = elabapi_python.ApiClient(elabapi_python.Configuration()).rest_client
+    calls = []
+
+    def send(*args, **kwargs):
+        calls.append(1)
+        if len(calls) <= len(failures):
+            raise failures[len(calls) - 1]
+        return "sent"
+
+    rest.request = send
+    client._guard_connection(rest, "test")
+    return rest, calls
+
+
+def _failed(reason):
+    return urllib3.exceptions.MaxRetryError(None, "/", reason)
+
+
+def _connect_failure():
+    return _failed(urllib3.exceptions.ConnectTimeoutError(None, "/", "timed out"))
+
+
+def test_dropped_connection_is_tried_again():
+    rest, calls = _guarded_sender([_connect_failure(), _connect_failure()])
+    assert rest.request("POST", "http://x") == "sent"
+    assert len(calls) == 3
+
+
+def test_gives_up_after_three_connection_attempts():
+    rest, calls = _guarded_sender([_connect_failure() for _ in range(5)])
+    with pytest.raises(ELNError, match="Couldn't reach the ELN"):
+        rest.request("POST", "http://x")
+    assert len(calls) == 3
+
+
+def test_a_request_that_was_sent_is_never_repeated():
+    # A read timeout means the ELN may have saved it, so sending it again could make a duplicate
+    rest, calls = _guarded_sender([_failed(urllib3.exceptions.ReadTimeoutError(None, "/", "timed out"))])
+    with pytest.raises(ELNError, match="didn't answer in time"):
+        rest.request("POST", "http://x")
+    assert len(calls) == 1
 
 
 class _Redirecting(http.server.BaseHTTPRequestHandler):
@@ -187,7 +235,7 @@ def test_fields_in_order_uses_position_and_puts_the_rest_last():
     assert list(client._fields_in_order(metadata)) == ["a", "b", "c"]
 
 
-@pytest.mark.parametrize("metadata", [None, "", "{}"])
+@pytest.mark.parametrize("metadata", [None, "", "{}", '{"extra_fields": []}', '{"extra_fields": null}'])
 def test_fields_in_order_with_no_fields(metadata):
     assert client._fields_in_order(metadata) == {}
 
