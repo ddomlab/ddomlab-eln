@@ -103,7 +103,7 @@ print(f"Logged as experiment #{exp_id}")
 | Link another experiment | `eln.link_experiment(exp_id, other_id)` |
 | See what's linked | `eln.get_links(exp_id)` |
 
-For the details of any function, use `help()` in Python, for example `help(ELN.find_experiments)`.
+For the details of any function, see the [reference documentation](https://ddomlab.github.io/ddomlab-eln/ddomlab_eln.html) or use `help()` in Python, for example `help(ELN.find_experiments)`.
 
 ## Find experiments and link them
 
